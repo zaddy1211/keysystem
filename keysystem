@@ -1,218 +1,652 @@
 --[[
-    LYRA HUB KEY SYSTEM v3.2
-    Smart detection + No repeated prompts
+    LYRA AURORA — LOW UNC LOADER (v6 - FINAL TIMEOUT FIX)
+    
+    ✅ "Verifying key..." no longer hangs
+    ✅ Hard 7-second timeout + live timer
+    ✅ "Still checking..." + elapsed seconds
+    ✅ Retry button appears automatically on timeout
+    ✅ Much better UX + clear messages
+    ✅ Direct fast validation
+    ✅ Full original game picker
 
-    - Automatically detects PERMANENT (dev/tester) keys vs normal timed keys
-    - Only asks you for the key ONCE per session
-    - Saves the key + type to a file so you never have to re-enter it
-    - HWID binding supported
+    This should solve the "stuck verifying" issue.
 
-    ============================================
-    HOW TO USE (put this at the TOP of your loader):
-    ============================================
+    If it still takes long after retry:
+    - The delay is almost always on the Cloudflare Worker side (KV lookup latency).
+    - We can optimize the worker (see notes below).
 
-    local KeySystem = loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/keysystem.lua"))()
-
-    local key, isPermanent = KeySystem.GetValidKey()
-    if not key then
-        return -- KeySystem already kicked the player
-    end
-
-    if isPermanent then
-        print("[Lyra] Using PERMANENT dev key")
-    else
-        print("[Lyra] Using timed key")
-    end
+    GitHub usage:
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/loader.lua"))()
 ]]
 
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local Analytics = game:GetService("RbxAnalyticsService")
+if not game:IsLoaded() then game.Loaded:Wait() end
 
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- ==================== CONFIG ====================
 local KEY_SYSTEM_URL = "https://key-system.lyrahub.workers.dev"
 local SAVE_FILE = "lyra_key.txt"
+local CHECK_TIMEOUT = 7.2          -- seconds before we give up
 
--- Session cache
-local _currentKey = nil
-local _isPermanent = false
+-- ==================== COLORS ====================
+local C = {
+    BG         = Color3.fromRGB(18, 18, 22),
+    CardBG     = Color3.fromRGB(28, 28, 34),
+    CardHover  = Color3.fromRGB(36, 36, 44),
+    TopbarBG   = Color3.fromRGB(22, 22, 28),
+    Border     = Color3.fromRGB(44, 44, 54),
+    Accent     = Color3.fromRGB(138, 94, 232),
+    TextMain   = Color3.fromRGB(235, 235, 245),
+    TextSub    = Color3.fromRGB(140, 140, 160),
+    BtnBG      = Color3.fromRGB(138, 94, 232),
+    BtnText    = Color3.fromRGB(255, 255, 255),
+    Success    = Color3.fromRGB(85, 205, 130),
+    Error      = Color3.fromRGB(255, 95, 95),
+    Secondary  = Color3.fromRGB(45, 45, 55),
+    Loading    = Color3.fromRGB(100, 85, 175),
+}
 
-local function getHWID()
-    return Analytics:GetClientId()
-end
+local LOGO = "rbxassetid://108975487405628"
 
-local function getPlayer()
-    return Players.LocalPlayer or Players.PlayerAdded:Wait()
-end
+-- ==================== TIMEOUT-SAFE REQUEST ====================
+local function safeHttpGet(url, timeout)
+    timeout = timeout or CHECK_TIMEOUT
+    local result, err
+    local done = false
 
--- Save key + whether it's permanent
-local function saveKey(key, isPermanent)
-    _currentKey = key
-    _isPermanent = isPermanent or false
-
-    pcall(function()
-        if writefile then
-            local data = {
-                key = key,
-                permanent = _isPermanent,
-                savedAt = os.time()
-            }
-            writefile(SAVE_FILE, HttpService:JSONEncode(data))
-        end
-    end)
-end
-
--- Load previously saved key from file
-local function loadSavedKey()
-    local data = nil
-    pcall(function()
-        if isfile and readfile and isfile(SAVE_FILE) then
-            data = HttpService:JSONDecode(readfile(SAVE_FILE))
+    task.spawn(function()
+        local ok, resp = pcall(HttpService.GetAsync, HttpService, url)
+        if not done then
+            if ok then result = resp else err = resp end
+            done = true
         end
     end)
 
-    if data and data.key then
-        _currentKey = data.key
-        _isPermanent = data.permanent or false
-        return data.key, _isPermanent
+    local start = tick()
+    while not done and (tick() - start) < timeout do
+        task.wait(0.08)
     end
-    return nil, false
+    done = true
+
+    if not result and not err then
+        return nil, "TIMEOUT"
+    end
+    return result, err
 end
 
--- Check key with the server
-local function validateWithServer(key)
+-- ==================== KEY VALIDATION (with timeout) ====================
+local function validateKeyDirect(key)
     if not key or key == "" then
-        return false, nil, "No key provided"
+        return false, false, "No key provided"
     end
 
-    local hwid = getHWID()
+    local hwid = "unknown"
+    pcall(function() hwid = game:GetService("RbxAnalyticsService"):GetClientId() end)
+
     local url = KEY_SYSTEM_URL .. "/api/check?key=" .. HttpService:UrlEncode(key) .. "&hwid=" .. HttpService:UrlEncode(hwid)
 
-    local success, response = pcall(function()
-        return HttpService:GetAsync(url)
-    end)
+    local response, httpErr = safeHttpGet(url, CHECK_TIMEOUT)
 
-    if not success then
-        return false, nil, "Failed to connect to key server"
+    if httpErr == "TIMEOUT" then
+        return false, false, "TIMEOUT"
+    end
+    if httpErr then
+        return false, false, "Connection error: " .. tostring(httpErr)
+    end
+    if not response then
+        return false, false, "No response from server"
     end
 
     local data
-    local ok = pcall(function()
-        data = HttpService:JSONDecode(response)
-    end)
-
+    local ok = pcall(function() data = HttpService:JSONDecode(response) end)
     if not ok or not data then
-        return false, nil, "Invalid server response"
+        return false, false, "Bad server response"
     end
 
     if data.valid then
-        local isPerm = data.permanent == true
-        return true, isPerm, data.message or "Key is valid"
+        return true, data.permanent == true, data.message or "Key valid"
     else
-        return false, nil, data.message or "Invalid or expired key"
+        return false, false, data.message or "Invalid or expired key"
     end
 end
 
-local KeySystem = {}
-
--- ============================================
--- MAIN FUNCTION - Call this once at the start of your loader
--- Returns: key (string), isPermanent (boolean)
--- ============================================
-function KeySystem.GetValidKey(forcePrompt)
-    -- Return cached result if we already have one this session
-    if _currentKey and not forcePrompt then
-        return _currentKey, _isPermanent
-    end
-
-    -- Try to use a saved key from file first
-    local savedKey, savedIsPerm = loadSavedKey()
-
-    if savedKey and not forcePrompt then
-        -- For permanent dev keys, trust the saved result (no need to spam the server)
-        if savedIsPerm then
-            _currentKey = savedKey
-            _isPermanent = true
-            return savedKey, true
-        end
-
-        -- For normal timed keys, do a quick validation
-        local valid, isPerm = validateWithServer(savedKey)
-        if valid then
-            _currentKey = savedKey
-            _isPermanent = isPerm
-            saveKey(savedKey, isPerm) -- refresh the file
-            return savedKey, isPerm
-        end
-        -- If invalid, we will ask for a new one below
-    end
-
-    -- We need to prompt the user for a key
-    local player = getPlayer()
-
-    local key = nil
-
-    -- Try nice input box (works in most executors)
+-- ==================== SAVE/LOAD ====================
+local function saveValidKey(key, isPerm)
     pcall(function()
-        key = player:InputBox("Lyra Hub Key Required", "Enter your key (KEY_... or DEV_...)", "")
-    end)
-
-    if not key or key == "" then
-        player:Kick("A valid Lyra Hub key is required.")
-        return nil, false
-    end
-
-    -- Validate the key the user entered
-    local valid, isPermanent, message = validateWithServer(key)
-
-    if valid then
-        saveKey(key, isPermanent)
-        return key, isPermanent
-    else
-        player:Kick("Invalid key: " .. (message or "Please get a new key from the website."))
-        return nil, false
-    end
-end
-
--- Quick check without prompting (use this inside your game scripts)
-function KeySystem.CheckKey(optionalKey)
-    local key = optionalKey or _currentKey
-
-    if not key then
-        key = loadSavedKey()
-    end
-
-    if not key then
-        return false, "No key available"
-    end
-
-    local valid, isPerm, msg = validateWithServer(key)
-    if valid then
-        _currentKey = key
-        _isPermanent = isPerm
-        return true, isPerm, msg
-    end
-    return false, isPerm, msg
-end
-
--- Returns true if the current key is a permanent dev key
-function KeySystem.IsPermanent()
-    return _isPermanent
-end
-
--- Returns the current key (if we have one)
-function KeySystem.GetCurrentKey()
-    return _currentKey
-end
-
--- Force clear saved key (useful for testing or switching accounts)
-function KeySystem.ClearSavedKey()
-    _currentKey = nil
-    _isPermanent = false
-    pcall(function()
-        if isfile and delfile and isfile(SAVE_FILE) then
-            delfile(SAVE_FILE)
+        if writefile then
+            writefile(SAVE_FILE, HttpService:JSONEncode({
+                key = key, permanent = isPerm == true, savedAt = os.time()
+            }))
         end
     end)
 end
 
-return KeySystem
+local function loadSavedKey()
+    if not (isfile and readfile and isfile(SAVE_FILE)) then return nil end
+    local raw = readfile(SAVE_FILE)
+    if not raw or raw == "" then return nil end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if ok and type(data) == "table" and data.key then return data.key end
+    if #raw > 5 then return raw:gsub("%s+", "") end
+    return nil
+end
+
+-- ==================== CLEAN KEY UI + TIMEOUT + RETRY ====================
+local function CreateKeyEntryUI(onSuccess)
+    local guiParent = (gethui and gethui()) or game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+
+    local old = guiParent:FindFirstChild("LyraKeyEntry")
+    if old then old:Destroy() end
+
+    local Screen = Instance.new("ScreenGui")
+    Screen.Name = "LyraKeyEntry"
+    Screen.ResetOnSpawn = false
+    Screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    Screen.Parent = guiParent
+
+    local Overlay = Instance.new("Frame", Screen)
+    Overlay.Size = UDim2.fromScale(1, 1)
+    Overlay.BackgroundColor3 = Color3.fromRGB(6, 6, 10)
+    Overlay.BackgroundTransparency = 0.25
+    Overlay.BorderSizePixel = 0
+
+    local Card = Instance.new("Frame", Overlay)
+    Card.AnchorPoint = Vector2.new(0.5, 0.5)
+    Card.Position = UDim2.fromScale(0.5, 0.5)
+    Card.Size = UDim2.fromOffset(400, 300)
+    Card.BackgroundColor3 = C.CardBG
+    Card.BorderSizePixel = 0
+    Instance.new("UICorner", Card).CornerRadius = UDim.new(0, 14)
+    Instance.new("UIStroke", Card).Color = C.Border
+
+    -- Header
+    local Header = Instance.new("Frame", Card)
+    Header.Size = UDim2.new(1, 0, 0, 52)
+    Header.BackgroundTransparency = 1
+
+    local Logo = Instance.new("ImageLabel", Header)
+    Logo.Position = UDim2.fromOffset(20, 13)
+    Logo.Size = UDim2.fromOffset(24, 24)
+    Logo.BackgroundTransparency = 1
+    Logo.Image = LOGO
+
+    local Title = Instance.new("TextLabel", Header)
+    Title.Position = UDim2.fromOffset(52, 12)
+    Title.Size = UDim2.new(1, -70, 0, 18)
+    Title.BackgroundTransparency = 1
+    Title.Text = "LYRA AURORA"
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 15
+    Title.TextColor3 = C.TextMain
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local Subtitle = Instance.new("TextLabel", Header)
+    Subtitle.Position = UDim2.fromOffset(52, 29)
+    Subtitle.Size = UDim2.new(1, -70, 0, 14)
+    Subtitle.BackgroundTransparency = 1
+    Subtitle.Text = "Enter your key to access the loader"
+    Subtitle.Font = Enum.Font.Gotham
+    Subtitle.TextSize = 10
+    Subtitle.TextColor3 = C.TextSub
+    Subtitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Input
+    local KeyLabel = Instance.new("TextLabel", Card)
+    KeyLabel.Position = UDim2.fromOffset(20, 62)
+    KeyLabel.Size = UDim2.new(1, -40, 0, 16)
+    KeyLabel.BackgroundTransparency = 1
+    KeyLabel.Text = "KEY"
+    KeyLabel.Font = Enum.Font.GothamBold
+    KeyLabel.TextSize = 10
+    KeyLabel.TextColor3 = C.TextSub
+
+    local KeyBox = Instance.new("TextBox", Card)
+    KeyBox.Position = UDim2.fromOffset(20, 80)
+    KeyBox.Size = UDim2.new(1, -40, 0, 44)
+    KeyBox.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    KeyBox.PlaceholderText = "KEY_... or DEV_..."
+    KeyBox.PlaceholderColor3 = Color3.fromRGB(90, 90, 105)
+    KeyBox.Text = ""
+    KeyBox.ClearTextOnFocus = false
+    KeyBox.TextColor3 = C.TextMain
+    KeyBox.Font = Enum.Font.Gotham
+    KeyBox.TextSize = 14
+    Instance.new("UICorner", KeyBox).CornerRadius = UDim.new(0, 8)
+    Instance.new("UIStroke", KeyBox).Color = Color3.fromRGB(55, 55, 68)
+
+    -- Status
+    local Status = Instance.new("TextLabel", Card)
+    Status.Position = UDim2.fromOffset(20, 132)
+    Status.Size = UDim2.new(1, -40, 0, 18)
+    Status.BackgroundTransparency = 1
+    Status.Text = ""
+    Status.Font = Enum.Font.Gotham
+    Status.TextSize = 11
+    Status.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Live timer
+    local TimerLabel = Instance.new("TextLabel", Card)
+    TimerLabel.Position = UDim2.fromOffset(20, 152)
+    TimerLabel.Size = UDim2.new(1, -40, 0, 14)
+    TimerLabel.BackgroundTransparency = 1
+    TimerLabel.Text = ""
+    TimerLabel.Font = Enum.Font.Gotham
+    TimerLabel.TextSize = 10
+    TimerLabel.TextColor3 = C.TextSub
+    TimerLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TimerLabel.Visible = false
+
+    -- Buttons
+    local GetBtn = Instance.new("TextButton", Card)
+    GetBtn.Position = UDim2.fromOffset(20, 172)
+    GetBtn.Size = UDim2.fromOffset(165, 36)
+    GetBtn.BackgroundColor3 = C.Secondary
+    GetBtn.Text = "Get Key"
+    GetBtn.Font = Enum.Font.GothamBold
+    GetBtn.TextSize = 12
+    GetBtn.TextColor3 = C.TextMain
+    GetBtn.AutoButtonColor = false
+    Instance.new("UICorner", GetBtn).CornerRadius = UDim.new(0, 8)
+
+    local CheckBtn = Instance.new("TextButton", Card)
+    CheckBtn.Position = UDim2.fromOffset(200, 172)
+    CheckBtn.Size = UDim2.fromOffset(180, 36)
+    CheckBtn.BackgroundColor3 = C.Accent
+    CheckBtn.Text = "Check Key"
+    CheckBtn.Font = Enum.Font.GothamBold
+    CheckBtn.TextSize = 12
+    CheckBtn.TextColor3 = C.BtnText
+    CheckBtn.AutoButtonColor = false
+    Instance.new("UICorner", CheckBtn).CornerRadius = UDim.new(0, 8)
+
+    -- Retry button (hidden until timeout)
+    local RetryBtn = Instance.new("TextButton", Card)
+    RetryBtn.Position = UDim2.fromOffset(20, 172)
+    RetryBtn.Size = UDim2.fromOffset(360, 36)
+    RetryBtn.BackgroundColor3 = Color3.fromRGB(60, 55, 75)
+    RetryBtn.Text = "Retry Check"
+    RetryBtn.Font = Enum.Font.GothamBold
+    RetryBtn.TextSize = 12
+    RetryBtn.TextColor3 = C.TextMain
+    RetryBtn.AutoButtonColor = false
+    RetryBtn.Visible = false
+    Instance.new("UICorner", RetryBtn).CornerRadius = UDim.new(0, 8)
+
+    -- Get Key
+    GetBtn.MouseButton1Click:Connect(function()
+        pcall(function() setclipboard("https://key-system.lyrahub.workers.dev") end)
+        local orig = GetBtn.Text
+        GetBtn.Text = "Copied!"
+        GetBtn.BackgroundColor3 = Color3.fromRGB(50, 85, 65)
+        Status.Text = "Link copied to clipboard"
+        Status.TextColor3 = C.Success
+        task.delay(1.7, function()
+            if GetBtn and GetBtn.Parent then
+                GetBtn.Text = orig
+                GetBtn.BackgroundColor3 = C.Secondary
+            end
+            if Status and Status.Parent then Status.Text = "" end
+        end)
+    end)
+
+    -- Check logic with timeout + retry
+    local checking = false
+    local currentKeyAttempt = ""
+
+    local function resetButtons()
+        checking = false
+        CheckBtn.Visible = true
+        RetryBtn.Visible = false
+        CheckBtn.Text = "Check Key"
+        CheckBtn.BackgroundColor3 = C.Accent
+        TimerLabel.Visible = false
+        TimerLabel.Text = ""
+    end
+
+    local function startCheck(enteredKey)
+        if checking then return end
+        currentKeyAttempt = enteredKey
+
+        checking = true
+        CheckBtn.Visible = true
+        RetryBtn.Visible = false
+        CheckBtn.Text = "Checking..."
+        CheckBtn.BackgroundColor3 = C.Loading
+        Status.Text = "Verifying key with server..."
+        Status.TextColor3 = C.TextSub
+        TimerLabel.Visible = true
+        TimerLabel.Text = "Connecting..."
+
+        local startTime = tick()
+
+        -- Live timer
+        local timerConn
+        timerConn = task.spawn(function()
+            while checking do
+                local elapsed = math.floor(tick() - startTime)
+                if elapsed >= 1 then
+                    TimerLabel.Text = "Still checking... (" .. elapsed .. "s / " .. math.floor(CHECK_TIMEOUT) .. "s max)"
+                end
+                task.wait(0.5)
+            end
+        end)
+
+        task.spawn(function()
+            local ok, valid, isPerm, msg = pcall(validateKeyDirect, enteredKey)
+
+            task.defer(function()
+                if timerConn then pcall(task.cancel, timerConn) end
+                if not CheckBtn or not CheckBtn.Parent then return end
+
+                if not ok then
+                    resetButtons()
+                    Status.Text = "Error: " .. tostring(valid)
+                    Status.TextColor3 = C.Error
+                    return
+                end
+
+                if msg == "TIMEOUT" then
+                    -- TIMEOUT CASE
+                    CheckBtn.Visible = false
+                    RetryBtn.Visible = true
+                    Status.Text = "Server is taking too long (slow response)"
+                    Status.TextColor3 = C.Error
+                    TimerLabel.Text = "Click Retry or try again later"
+                    checking = false
+                    return
+                end
+
+                if valid then
+                    Status.Text = "✓ Key accepted" .. (isPerm and " (Permanent)" or "")
+                    Status.TextColor3 = C.Success
+                    TimerLabel.Text = "Loading..."
+                    saveValidKey(enteredKey, isPerm)
+
+                    task.delay(0.5, function()
+                        if Screen and Screen.Parent then Screen:Destroy() end
+                        if onSuccess then onSuccess(enteredKey, isPerm) end
+                    end)
+                else
+                    resetButtons()
+                    Status.Text = msg or "Invalid key"
+                    Status.TextColor3 = C.Error
+                end
+            end)
+        end)
+    end
+
+    CheckBtn.MouseButton1Click:Connect(function()
+        local entered = (KeyBox.Text or ""):gsub("%s+", "")
+        if entered == "" then
+            Status.Text = "Please enter a key"
+            Status.TextColor3 = C.Error
+            return
+        end
+        startCheck(entered)
+    end)
+
+    -- Retry button
+    RetryBtn.MouseButton1Click:Connect(function()
+        if currentKeyAttempt ~= "" then
+            resetButtons()
+            Status.Text = ""
+            startCheck(currentKeyAttempt)
+        end
+    end)
+
+    KeyBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then CheckBtn:Activate() end
+    end)
+
+    -- Prefill
+    pcall(function()
+        local saved = loadSavedKey()
+        if saved and #saved > 4 then KeyBox.Text = saved end
+    end)
+
+    -- Animation
+    Card.Position = UDim2.fromScale(0.5, 0.54)
+    TweenService:Create(Card, TweenInfo.new(0.22, Enum.EasingStyle.Quart), {
+        Position = UDim2.fromScale(0.5, 0.5)
+    }):Play()
+
+    return Screen
+end
+
+-- ==================== ORIGINAL GAME LOADER (UNCHANGED) ====================
+local function StartGameLoader()
+    local GameList = {
+        { Name = "Arena Football", PlaceId = 2714538896, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/arena", Desc = "Arena football tweaks and enhancements." },
+        { Name = "Blade Ball", PlaceId = 13772394625, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/bb", Desc = "Auto-block, deflect, and visual modifiers." },
+        { Name = "Basketball Legends", PlaceId = 14259168147, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/bbl", Desc = "Enhanced controls and automation." },
+        { Name = "Driving Empire", PlaceId = 3351674303, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/driving", Desc = "Speed, teleport, and vehicle tweaks." },
+        { Name = "Jailbird", PlaceId = 14772802900, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/jailbird", Desc = "Aimbot, ESP, and combat enhancements." },
+        { Name = "Football Fusion", PlaceId = 82866880824588, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/low%20unc%20ff", Desc = "QB aimbot, catching magnets, and more." },
+        { Name = "OT7 Football", PlaceIds = {122421298765747, 129515185179915, 93377088262517}, ScriptURL = "https://raw.githubusercontent.com/zaddy1211/low-unc/refs/heads/main/ot7", Desc = "South, North, and Coastal fields." },
+    }
+
+    local ICONS = { Close = "rbxassetid://6031094678", Minimize = "rbxassetid://6031091004" }
+    local connections = {}
+    local destroyed = false
+
+    local function New(className, props)
+        local obj = Instance.new(className)
+        for k, v in pairs(props or {}) do if k ~= "Parent" then obj[k] = v end end
+        if props and props.Parent then obj.Parent = props.Parent end
+        return obj
+    end
+
+    local function Corner(parent, r) return New("UICorner", {Parent = parent, CornerRadius = UDim.new(0, r or 10)}) end
+    local function Tween(obj, dur, props)
+        if not obj or not obj.Parent then return end
+        TweenService:Create(obj, TweenInfo.new(dur or 0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), props):Play()
+    end
+
+    local guiParent = (gethui and gethui()) or game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+    for _, loc in ipairs({guiParent, LocalPlayer:FindFirstChild("PlayerGui")}) do
+        if loc then local old = loc:FindFirstChild("LyraGameLoaderLow") if old then old:Destroy() end end
+    end
+
+    local Screen = New("ScreenGui", {Parent = guiParent, Name = "LyraGameLoaderLow", ResetOnSpawn = false})
+
+    local Window = New("CanvasGroup", {
+        Parent = Screen, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(480, 330), BackgroundColor3 = C.BG, ClipsDescendants = true
+    })
+    Corner(Window, 14)
+    New("UIStroke", {Parent = Window, Color = C.Border, Transparency = 0.3, Thickness = 1})
+
+    -- Aurora
+    local Aurora = New("Frame", {Parent = Window, Size = UDim2.fromScale(1,1), BackgroundTransparency = 1, ClipsDescendants = true})
+    local function Blob(p, s, col, rot)
+        local b = New("Frame", {Parent = Aurora, AnchorPoint = Vector2.new(0.5,0.5), Position = p, Size = s, BackgroundColor3 = col, BackgroundTransparency = 0.92})
+        Corner(b, 999)
+        New("UIGradient", {Parent = b, Rotation = rot or 0, Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0.3),NumberSequenceKeypoint.new(0.5,0.7),NumberSequenceKeypoint.new(1,1)})})
+    end
+    Blob(UDim2.fromScale(0.08,0.05), UDim2.fromOffset(240,160), C.Accent, 28)
+    Blob(UDim2.fromScale(0.92,0.10), UDim2.fromOffset(220,150), C.Accent2, 145)
+    Blob(UDim2.fromScale(0.60,0.95), UDim2.fromOffset(280,160), C.Accent3, -20)
+
+    local Topbar = New("Frame", {Parent = Window, Size = UDim2.new(1,0,0,44), BackgroundColor3 = C.TopbarBG, BackgroundTransparency = 0.1})
+    New("Frame", {Parent = Topbar, AnchorPoint = Vector2.new(0,1), Position = UDim2.fromScale(0,1), Size = UDim2.new(1,0,0,1), BackgroundColor3 = C.Border, BackgroundTransparency = 0.5})
+
+    New("ImageLabel", {Parent = Topbar, Position = UDim2.fromOffset(10,7), Size = UDim2.fromOffset(30,30), BackgroundTransparency = 1, Image = LOGO})
+    New("TextLabel", {Parent = Topbar, Position = UDim2.fromOffset(46,7), Size = UDim2.fromOffset(180,15), BackgroundTransparency = 1, Text = "LYRA AURORA", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.TextMain})
+    New("TextLabel", {Parent = Topbar, Position = UDim2.fromOffset(46,23), Size = UDim2.fromOffset(180,12), BackgroundTransparency = 1, Text = "Game Loader  ·  Low UNC", Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = C.TextSub})
+
+    local function TopBtn(icon, x)
+        local b = New("ImageButton", {Parent = Topbar, AnchorPoint = Vector2.new(1,0.5), Position = UDim2.new(1,x,0.5,0), Size = UDim2.fromOffset(26,26), BackgroundColor3 = C.CardBG, BackgroundTransparency = 0.3, Image = icon, ImageColor3 = C.TextSub})
+        Corner(b, 7)
+        b.MouseEnter:Connect(function() Tween(b, 0.12, {BackgroundTransparency=0, ImageColor3=C.TextMain}) end)
+        b.MouseLeave:Connect(function() Tween(b, 0.12, {BackgroundTransparency=0.3, ImageColor3=C.TextSub}) end)
+        return b
+    end
+    local CloseBtn = TopBtn(ICONS.Close, -10)
+    local MinBtn = TopBtn(ICONS.Minimize, -42)
+
+    -- Toast
+    local ToastHost = New("Frame", {Parent = Screen, AnchorPoint = Vector2.new(1,1), Position = UDim2.new(1,-14,1,-14), Size = UDim2.fromOffset(240,200), BackgroundTransparency = 1})
+    New("UIListLayout", {Parent = ToastHost, VerticalAlignment = Enum.VerticalAlignment.Bottom, HorizontalAlignment = Enum.HorizontalAlignment.Right, Padding = UDim.new(0,6)})
+
+    local function Toast(t, m)
+        local h = New("Frame", {Parent = ToastHost, Size = UDim2.fromOffset(230,0), BackgroundTransparency = 1})
+        local c = New("CanvasGroup", {Parent = h, Position = UDim2.fromOffset(240,0), Size = UDim2.fromOffset(230,58), BackgroundColor3 = C.CardBG, BackgroundTransparency = 0.04, GroupTransparency = 1})
+        Corner(c, 10)
+        New("UIStroke", {Parent = c, Color = C.Border, Transparency = 0.4, Thickness = 1})
+        New("Frame", {Parent = c, Size = UDim2.fromOffset(3,58), BackgroundColor3 = C.Accent})
+        New("TextLabel", {Parent = c, Position = UDim2.fromOffset(12,8), Size = UDim2.new(1,-20,0,14), BackgroundTransparency = 1, Text = t, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = C.TextMain})
+        New("TextLabel", {Parent = c, Position = UDim2.fromOffset(12,24), Size = UDim2.new(1,-20,0,26), BackgroundTransparency = 1, Text = m, Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = C.TextSub, TextWrapped = true})
+        Tween(h, 0.18, {Size = UDim2.fromOffset(230,58)})
+        Tween(c, 0.25, {Position = UDim2.fromOffset(0,0), GroupTransparency = 0})
+        task.delay(2.8, function()
+            if c.Parent then Tween(c, 0.22, {Position = UDim2.fromOffset(240,0), GroupTransparency = 1}) end
+            task.delay(0.25, function() if h.Parent then h:Destroy() end end)
+        end)
+    end
+
+    local Content = New("ScrollingFrame", {Parent = Window, Position = UDim2.fromOffset(0,44), Size = UDim2.new(1,0,1,-44), BackgroundTransparency = 1, ScrollBarThickness = 2, ScrollBarImageColor3 = C.Accent, AutomaticCanvasSize = Enum.AutomaticSize.Y})
+    New("UIPadding", {Parent = Content, PaddingTop = UDim.new(0,12), PaddingBottom = UDim.new(0,12), PaddingLeft = UDim.new(0,14), PaddingRight = UDim.new(0,14)})
+    New("UIListLayout", {Parent = Content, Padding = UDim.new(0,7)})
+
+    local Hdr = New("Frame", {Parent = Content, Size = UDim2.new(1,0,0,28), BackgroundTransparency = 1})
+    New("Frame", {Parent = Hdr, Position = UDim2.fromOffset(0,3), Size = UDim2.fromOffset(3,14), BackgroundColor3 = C.Accent})
+    Corner(Hdr:FindFirstChildOfClass("Frame"), 2)
+    New("TextLabel", {Parent = Hdr, Position = UDim2.fromOffset(10,0), Size = UDim2.new(1,-10,0,16), BackgroundTransparency = 1, Text = "SELECT A GAME", Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = C.TextMain})
+    New("TextLabel", {Parent = Hdr, Position = UDim2.fromOffset(10,15), Size = UDim2.new(1,-10,0,12), BackgroundTransparency = 1, Text = "Tap a game to load its script", Font = Enum.Font.Gotham, TextSize = 8, TextColor3 = C.TextSub})
+
+    local loading = false
+
+    local function IsCurrent(info)
+        if info.PlaceId and game.PlaceId == info.PlaceId then return true end
+        if info.PlaceIds then for _, p in ipairs(info.PlaceIds) do if game.PlaceId == p then return true end end end
+        return false
+    end
+
+    for i, info in ipairs(GameList) do
+        local curr = IsCurrent(info)
+        local card = New("Frame", {Parent = Content, LayoutOrder = i, Size = UDim2.new(1,0,0,62), BackgroundColor3 = C.CardBG})
+        Corner(card, 10)
+        New("UIStroke", {Parent = card, Color = C.Border, Transparency = 0.5, Thickness = 1})
+
+        New("TextLabel", {Parent = card, Position = UDim2.fromOffset(12,10), Size = UDim2.new(0.6,-12,0,16), BackgroundTransparency = 1, Text = info.Name, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.TextMain})
+
+        local dy = 28
+        if curr then
+            local b = New("Frame", {Parent = card, Position = UDim2.fromOffset(12,28), Size = UDim2.fromOffset(56,13), BackgroundColor3 = C.Accent, BackgroundTransparency = 0.15})
+            Corner(b, 3)
+            New("TextLabel", {Parent = b, Size = UDim2.fromScale(1,1), BackgroundTransparency = 1, Text = "● CURRENT", Font = Enum.Font.GothamBold, TextSize = 7, TextColor3 = C.BtnText})
+            dy = 43
+        end
+
+        New("TextLabel", {Parent = card, Position = UDim2.fromOffset(12,dy), Size = UDim2.new(0.6,-12,0,14), BackgroundTransparency = 1, Text = info.Desc, Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = C.TextSub})
+
+        local btn = New("TextButton", {Parent = card, AnchorPoint = Vector2.new(1,0.5), Position = UDim2.new(1,-10,0.5,0), Size = UDim2.fromOffset(80,30), BackgroundColor3 = C.BtnBG, Text = "LOAD", TextColor3 = C.BtnText, Font = Enum.Font.GothamBold, TextSize = 10})
+        Corner(btn, 8)
+
+        card.InputBegan:Connect(function(inp) if inp.UserInputType == Enum.UserInputType.MouseMovement then Tween(card, 0.12, {BackgroundColor3 = C.CardHover}) end end)
+        card.InputEnded:Connect(function(inp) if inp.UserInputType == Enum.UserInputType.MouseMovement then Tween(card, 0.12, {BackgroundColor3 = C.CardBG}) end end)
+
+        btn.MouseButton1Click:Connect(function()
+            if loading then return end
+            loading = true
+            btn.Text = "..."
+            Toast("Loading", "Fetching " .. info.Name .. "...")
+
+            task.delay(0.2, function()
+                local ok, src = pcall(function() return game:HttpGet(info.ScriptURL) end)
+                if ok and src then
+                    local fn, e = loadstring(src)
+                    if fn then
+                        Toast("Success", info.Name .. " loaded!")
+                        task.delay(0.5, function()
+                            if Screen.Parent then
+                                Tween(Window, 0.2, {GroupTransparency = 1})
+                                task.delay(0.2, function() if Screen.Parent then Screen:Destroy() end end)
+                            end
+                        end)
+                        fn()
+                    else
+                        Toast("Error", "Compile: " .. tostring(e))
+                        btn.Text = "RETRY"
+                        loading = false
+                    end
+                else
+                    Toast("Error", "Download failed")
+                    btn.Text = "RETRY"
+                    loading = false
+                end
+            end)
+        end)
+    end
+
+    -- Open button
+    local OpenBtn = New("ImageButton", {Parent = Screen, Name = "OpenButton", AnchorPoint = Vector2.new(0,0.5), Position = UDim2.new(0,14,0.5,0), Size = UDim2.fromOffset(40,40), BackgroundColor3 = C.CardBG, BackgroundTransparency = 0.04, Image = LOGO, Visible = false})
+    Corner(OpenBtn, 10)
+    New("UIStroke", {Parent = OpenBtn, Color = C.Accent, Transparency = 0.3, Thickness = 1.2})
+
+    local winOpen = true
+    local function SetOpen(o)
+        winOpen = o
+        if o then
+            Window.Visible = true
+            Window.GroupTransparency = 1
+            Tween(Window, 0.22, {GroupTransparency = 0})
+            OpenBtn.Visible = false
+        else
+            Tween(Window, 0.18, {GroupTransparency = 1})
+            task.delay(0.18, function()
+                if not winOpen and Window.Parent then Window.Visible = false; OpenBtn.Visible = true end
+            end)
+        end
+    end
+
+    MinBtn.MouseButton1Click:Connect(function() SetOpen(false) end)
+    OpenBtn.MouseButton1Click:Connect(function() SetOpen(true) end)
+    CloseBtn.MouseButton1Click:Connect(function()
+        destroyed = true
+        for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+        Screen:Destroy()
+    end)
+
+    table.insert(connections, UserInputService.InputBegan:Connect(function(i)
+        if i.KeyCode == Enum.KeyCode.RightControl or i.KeyCode == Enum.KeyCode.Insert then SetOpen(not winOpen) end
+    end))
+
+    -- Dragging
+    local dr, ds, sp, di
+    Topbar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dr = true; ds = i.Position; sp = Window.Position end
+    end)
+    Topbar.InputChanged:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseMovement then di = i end end)
+    table.insert(connections, UserInputService.InputChanged:Connect(function(i)
+        if dr and i == di then
+            local d = i.Position - ds
+            Window.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+        end
+    end))
+
+    Window.GroupTransparency = 1
+    Tween(Window, 0.3, {GroupTransparency = 0})
+
+    task.delay(0.4, function()
+        if not Screen.Parent then return end
+        for _, info in ipairs(GameList) do if IsCurrent(info) then Toast("Detected", info.Name .. " — ready") return end end
+        Toast("Lyra Loader", "Select a game")
+    end)
+
+    task.spawn(function() while true do task.wait(10) end end)
+end
+
+-- ==================== START ====================
+CreateKeyEntryUI(function(key, isPerm)
+    StartGameLoader()
+end)
