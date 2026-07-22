@@ -2,7 +2,7 @@
     LYRA HUB KEY SYSTEM v3.2
     Smart detection + No repeated prompts
 
-    - Automatically detects PERMANENT (dev) keys vs normal timed keys
+    - Automatically detects PERMANENT (dev/tester) keys vs normal timed keys
     - Only asks you for the key ONCE per session
     - Saves the key + type to a file so you never have to re-enter it
     - HWID binding supported
@@ -115,7 +115,7 @@ end
 local KeySystem = {}
 
 -- ============================================
--- MAIN FUNCTION - Call this once at the start of your loader/script
+-- MAIN FUNCTION - Call this once at the start of your loader
 -- Returns: key (string), isPermanent (boolean)
 -- ============================================
 function KeySystem.GetValidKey(forcePrompt)
@@ -143,6 +143,7 @@ function KeySystem.GetValidKey(forcePrompt)
             saveKey(savedKey, isPerm) -- refresh the file
             return savedKey, isPerm
         end
+        -- If invalid, we will ask for a new one below
     end
 
     -- We need to prompt the user for a key
