@@ -1,0 +1,217 @@
+--[[
+    LYRA HUB KEY SYSTEM v3.2
+    Smart detection + No repeated prompts
+
+    - Automatically detects PERMANENT (dev) keys vs normal timed keys
+    - Only asks you for the key ONCE per session
+    - Saves the key + type to a file so you never have to re-enter it
+    - HWID binding supported
+
+    ============================================
+    HOW TO USE (put this at the TOP of your loader):
+    ============================================
+
+    local KeySystem = loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/keysystem.lua"))()
+
+    local key, isPermanent = KeySystem.GetValidKey()
+    if not key then
+        return -- KeySystem already kicked the player
+    end
+
+    if isPermanent then
+        print("[Lyra] Using PERMANENT dev key")
+    else
+        print("[Lyra] Using timed key")
+    end
+]]
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local Analytics = game:GetService("RbxAnalyticsService")
+
+local KEY_SYSTEM_URL = "https://key-system.lyrahub.workers.dev"
+local SAVE_FILE = "lyra_key.txt"
+
+-- Session cache
+local _currentKey = nil
+local _isPermanent = false
+
+local function getHWID()
+    return Analytics:GetClientId()
+end
+
+local function getPlayer()
+    return Players.LocalPlayer or Players.PlayerAdded:Wait()
+end
+
+-- Save key + whether it's permanent
+local function saveKey(key, isPermanent)
+    _currentKey = key
+    _isPermanent = isPermanent or false
+
+    pcall(function()
+        if writefile then
+            local data = {
+                key = key,
+                permanent = _isPermanent,
+                savedAt = os.time()
+            }
+            writefile(SAVE_FILE, HttpService:JSONEncode(data))
+        end
+    end)
+end
+
+-- Load previously saved key from file
+local function loadSavedKey()
+    local data = nil
+    pcall(function()
+        if isfile and readfile and isfile(SAVE_FILE) then
+            data = HttpService:JSONDecode(readfile(SAVE_FILE))
+        end
+    end)
+
+    if data and data.key then
+        _currentKey = data.key
+        _isPermanent = data.permanent or false
+        return data.key, _isPermanent
+    end
+    return nil, false
+end
+
+-- Check key with the server
+local function validateWithServer(key)
+    if not key or key == "" then
+        return false, nil, "No key provided"
+    end
+
+    local hwid = getHWID()
+    local url = KEY_SYSTEM_URL .. "/api/check?key=" .. HttpService:UrlEncode(key) .. "&hwid=" .. HttpService:UrlEncode(hwid)
+
+    local success, response = pcall(function()
+        return HttpService:GetAsync(url)
+    end)
+
+    if not success then
+        return false, nil, "Failed to connect to key server"
+    end
+
+    local data
+    local ok = pcall(function()
+        data = HttpService:JSONDecode(response)
+    end)
+
+    if not ok or not data then
+        return false, nil, "Invalid server response"
+    end
+
+    if data.valid then
+        local isPerm = data.permanent == true
+        return true, isPerm, data.message or "Key is valid"
+    else
+        return false, nil, data.message or "Invalid or expired key"
+    end
+end
+
+local KeySystem = {}
+
+-- ============================================
+-- MAIN FUNCTION - Call this once at the start of your loader/script
+-- Returns: key (string), isPermanent (boolean)
+-- ============================================
+function KeySystem.GetValidKey(forcePrompt)
+    -- Return cached result if we already have one this session
+    if _currentKey and not forcePrompt then
+        return _currentKey, _isPermanent
+    end
+
+    -- Try to use a saved key from file first
+    local savedKey, savedIsPerm = loadSavedKey()
+
+    if savedKey and not forcePrompt then
+        -- For permanent dev keys, trust the saved result (no need to spam the server)
+        if savedIsPerm then
+            _currentKey = savedKey
+            _isPermanent = true
+            return savedKey, true
+        end
+
+        -- For normal timed keys, do a quick validation
+        local valid, isPerm = validateWithServer(savedKey)
+        if valid then
+            _currentKey = savedKey
+            _isPermanent = isPerm
+            saveKey(savedKey, isPerm) -- refresh the file
+            return savedKey, isPerm
+        end
+    end
+
+    -- We need to prompt the user for a key
+    local player = getPlayer()
+
+    local key = nil
+
+    -- Try nice input box (works in most executors)
+    pcall(function()
+        key = player:InputBox("Lyra Hub Key Required", "Enter your key (KEY_... or DEV_...)", "")
+    end)
+
+    if not key or key == "" then
+        player:Kick("A valid Lyra Hub key is required.")
+        return nil, false
+    end
+
+    -- Validate the key the user entered
+    local valid, isPermanent, message = validateWithServer(key)
+
+    if valid then
+        saveKey(key, isPermanent)
+        return key, isPermanent
+    else
+        player:Kick("Invalid key: " .. (message or "Please get a new key from the website."))
+        return nil, false
+    end
+end
+
+-- Quick check without prompting (use this inside your game scripts)
+function KeySystem.CheckKey(optionalKey)
+    local key = optionalKey or _currentKey
+
+    if not key then
+        key = loadSavedKey()
+    end
+
+    if not key then
+        return false, "No key available"
+    end
+
+    local valid, isPerm, msg = validateWithServer(key)
+    if valid then
+        _currentKey = key
+        _isPermanent = isPerm
+        return true, isPerm, msg
+    end
+    return false, isPerm, msg
+end
+
+-- Returns true if the current key is a permanent dev key
+function KeySystem.IsPermanent()
+    return _isPermanent
+end
+
+-- Returns the current key (if we have one)
+function KeySystem.GetCurrentKey()
+    return _currentKey
+end
+
+-- Force clear saved key (useful for testing or switching accounts)
+function KeySystem.ClearSavedKey()
+    _currentKey = nil
+    _isPermanent = false
+    pcall(function()
+        if isfile and delfile and isfile(SAVE_FILE) then
+            delfile(SAVE_FILE)
+        end
+    end)
+end
+
+return KeySystem
