@@ -3098,118 +3098,58 @@ local function LoadQBAimbot()
     -- ═══════════════════════════════════════════════════════════════
     -- BEAM VISUAL ENGINE
     -- Single arc beam: 1 Beam + 2 Attachments (was 40 Beams + 80 Attachments).
-    -- A Beam is a cubic Bezier: P1 sits CurveSize0 studs along Attachment0's
-    -- +X axis and P2 sits CurveSize1 studs along Attachment1's -X axis, so
-    -- aiming each attachment's RightVector along the endpoint velocity makes
-    -- the one beam trace the exact throw parabola.
+    -- Curve solved by Kinematics.BeamProjectile; no ball-trail effect.
     -- ═══════════════════════════════════════════════════════════════
     local BeamEngine = {
+        beam = nil,
         attach0 = nil,
         attach1 = nil,
-        beam = nil,
     }
 
-    -- Orthonormal CFrame whose RightVector (+X) points along `dir`.
-    local function BeamRightAxisCFrame(pos, dir)
-        local x = ((tonumber(dir.Magnitude) or 0) > 1e-4) and dir.Unit or Vector3.new(0, 1, 0)
-        local ySeed = (math.abs(x.Y) < 0.95) and Vector3.new(0, 1, 0) or Vector3.new(1, 0, 0)
-        local z = x:Cross(ySeed).Unit
-        local y = z:Cross(x)
-        return CFrame.fromMatrix(pos, x, y, z)
-    end
-
-    -- Arc end, truncated at ground height (same rule the 40-segment version used).
-    local function BeamSolveArc(x0, v0, airtime, groundY)
-        local T = math.max(tonumber(airtime) or 0.1, 0.1)
-        local endPos = x0 + (v0 * T) + Vector3.new(0, -GRAVITY * 0.5 * T * T, 0)
-
-        if endPos.Y < groundY then
-            local tLand = nil
-            if x0.Y > groundY then
-                local disc = (v0.Y * v0.Y) + (2 * GRAVITY * (x0.Y - groundY))
-                if disc > 0 then
-                    tLand = (v0.Y + math.sqrt(disc)) / GRAVITY
-                end
-            end
-            if tLand and tLand > 1e-3 and tLand < T then
-                T = tLand
-            else
-                T = 1e-3 -- starts at/under ground: collapse to a stub (old behaviour)
-            end
-            endPos = x0 + (v0 * T) + Vector3.new(0, -GRAVITY * 0.5 * T * T, 0)
-            endPos = Vector3.new(endPos.X, groundY, endPos.Z)
-        end
-
-        return T, endPos
-    end
-
-    -- Positions/orients an attachment pair and sets the two curve sizes so the
-    -- beam matches the launch parabola of (x0, v0) over [0, T]:
-    -- quadratic Bezier (control point x0 + v0*T/2) degree-elevated to cubic.
-    local function BeamApplyArc(attach0, attach1, beam, x0, v0, T, endPos)
-        local vEnd = v0 + Vector3.new(0, -GRAVITY * T, 0)
-        attach0.WorldCFrame = BeamRightAxisCFrame(x0, v0)
-        attach1.WorldCFrame = BeamRightAxisCFrame(endPos, vEnd)
-        beam.CurveSize0 = (v0 * (T / 3)).Magnitude
-        beam.CurveSize1 = (vEnd * (T / 3)).Magnitude
-    end
-
     do
-        local attach0 = Instance.new('Attachment', workspace.Terrain)
-        local attach1 = Instance.new('Attachment', workspace.Terrain)
+        BeamEngine.attach0 = Instance.new('Attachment', workspace.Terrain)
+        BeamEngine.attach1 = Instance.new('Attachment', workspace.Terrain)
 
-        local beam = Instance.new('Beam')
-        beam.Attachment0 = attach0
-        beam.Attachment1 = attach1
-        beam.Segments = 7500 -- single beam, high segment count
-        beam.Width0 = 1
-        beam.Width1 = 1
-        beam.FaceCamera = true
-        beam.Color = ColorSequence.new(Theme.Accent)
-        beam.Transparency = NumberSequence.new({
+        BeamEngine.beam = Instance.new('Beam')
+        BeamEngine.beam.Attachment0 = BeamEngine.attach0
+        BeamEngine.beam.Attachment1 = BeamEngine.attach1
+        BeamEngine.beam.Segments = 7500
+        BeamEngine.beam.Width0 = 1
+        BeamEngine.beam.Width1 = 1
+        BeamEngine.beam.FaceCamera = true
+        BeamEngine.beam.Color = ColorSequence.new(Theme.Accent)
+        BeamEngine.beam.Transparency = NumberSequence.new({
             NumberSequenceKeypoint.new(0, 1),
             NumberSequenceKeypoint.new(0.01, 0),
             NumberSequenceKeypoint.new(1, 0),
         })
-        beam.Enabled = true
-        beam.Parent = workspace.Terrain
+        BeamEngine.beam.Enabled = true
+        BeamEngine.beam.Parent = workspace.Terrain
 
-        RegisterVisualTheme(beam, function()
-            beam.Color = ColorSequence.new(Theme.Accent)
+        RegisterVisualTheme(BeamEngine.beam, function()
+            BeamEngine.beam.Color = ColorSequence.new(Theme.Accent)
         end)
-
-        BeamEngine.attach0 = attach0
-        BeamEngine.attach1 = attach1
-        BeamEngine.beam = beam
     end
 
     function BeamEngine.Update(startOrigin, drawDir, airtime)
-        local beam = BeamEngine.beam
-        local attach0 = BeamEngine.attach0
-        local attach1 = BeamEngine.attach1
-        if not (beam and attach0 and attach1) then return end
+        local safeAirtime = math.max(tonumber(airtime) or 0.1, 0.1)
+        local g = Vector3.new(0, -GRAVITY, 0)
+        local v0 = drawDir
+        local x0 = startOrigin + (drawDir.Unit * 5)
 
-        local v0 = (typeof(drawDir) == 'Vector3') and drawDir or Vector3.new(0, 1, 0)
-        if (tonumber(v0.Magnitude) or 0) < 1e-3 then
-            v0 = Vector3.new(0, 1, 0)
-        end
-        local x0 = startOrigin + (v0.Unit * 5)
+        local curve0, curve1, cf1, cf2 = Kinematics.BeamProjectile(g, v0, x0, safeAirtime)
 
-        local T, endPos = BeamSolveArc(x0, v0, airtime, 4)
-        BeamApplyArc(attach0, attach1, beam, x0, v0, T, endPos)
-        beam.Enabled = true
+        BeamEngine.beam.CurveSize0 = curve0
+        BeamEngine.beam.CurveSize1 = curve1
+        BeamEngine.attach0.WorldCFrame = cf1
+        BeamEngine.attach1.WorldCFrame = cf2
+        BeamEngine.beam.Enabled = true
     end
 
     function BeamEngine.Hide()
-        if BeamEngine.beam then
-            BeamEngine.beam.Enabled = false
-        end
-        if BeamEngine.attach0 then
-            BeamEngine.attach0.WorldPosition = Vector3.new(0, -9999, 0)
-        end
-        if BeamEngine.attach1 then
-            BeamEngine.attach1.WorldPosition = Vector3.new(0, -9999, 0)
-        end
+        BeamEngine.beam.Enabled = false
+        BeamEngine.attach0.WorldPosition = Vector3.new(0, -9999, 0)
+        BeamEngine.attach1.WorldPosition = Vector3.new(0, -9999, 0)
     end
 
     function BeamEngine.SpawnTrailBall(ball)
@@ -3224,8 +3164,8 @@ local function LoadQBAimbot()
                 safeDirection = Vector3.new(0, 1, 0)
             end
             local safeAirtime = math.max(tonumber(ThrowState.airtime) or 0.1, 0.1)
+            local g = Vector3.new(0, -GRAVITY, 0)
             local x0 = lpHead.Position + (safeDirection.Unit * 5)
-            local T, endPos = BeamSolveArc(x0, safeDirection, safeAirtime, 4)
 
             local tAttach0 = Instance.new('Attachment', workspace.Terrain)
             local tAttach1 = Instance.new('Attachment', workspace.Terrain)
@@ -3246,7 +3186,11 @@ local function LoadQBAimbot()
             tBeam.Parent = workspace.Terrain
             RegisterVisualTheme(tBeam, function() tBeam.Color = ColorSequence.new(Theme.Accent) end)
 
-            BeamApplyArc(tAttach0, tAttach1, tBeam, x0, safeDirection, T, endPos)
+            local curve0, curve1, cf1, cf2 = Kinematics.BeamProjectile(g, safeDirection, x0, safeAirtime)
+            tBeam.CurveSize0 = curve0
+            tBeam.CurveSize1 = curve1
+            tAttach0.WorldCFrame = cf1
+            tAttach1.WorldCFrame = cf2
             tBeam.Enabled = true
 
             task.delay(safeAirtime, function()
@@ -4012,9 +3956,9 @@ local function LoadQBAimbot()
         end
     end)
 
-    -- ═══════════════════════════════════════════════════════════════
+    -- ══════════════════════════════════════════════════════════════════
     -- BALL TRAIL HANDLER
-    -- ═══════════════════════════════════════════════════════════════
+    -- ══════════════════════════════════════════════════════════════════
     workspace.ChildAdded:Connect(function(v)
         if not State.enableQbAimbot then return end
         if v:IsA('BasePart') and v.Name == 'Football' then
