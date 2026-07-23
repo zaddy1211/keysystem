@@ -2099,8 +2099,12 @@ BindTheme(function()
     local alive = {}
     for i = 1, #VisualThemeTargets do
         local e = VisualThemeTargets[i]
-        local ok, has = pcall(function() return e.Inst and e.Inst.Parent end)
-        if ok and has then
+        -- A destroyed Instance errors on property reads other than Parent,
+        -- so .Name is the liveness probe: a merely *unparented* visual
+        -- (e.g. a hidden magnet radius sphere) must still be recoloured
+        -- and kept in the registry instead of being pruned theme-blind.
+        local ok = pcall(function() return e.Inst.Name end)
+        if ok then
             pcall(e.Apply)
             table.insert(alive, e)
         end
@@ -3158,47 +3162,86 @@ local function LoadQBAimbot()
         local lpHead = lpChar and lpChar:FindFirstChild('Head')
         if not lpHead then return end
 
-        if ball:GetAttribute('LocalAimbotBall') or (ball.Position - lpHead.Position).Magnitude < 15 then
-            local safeDirection = ThrowState.direction or Vector3.new(0, 1, 0)
-            if (tonumber(safeDirection.Magnitude) or 0) < 1e-3 then
-                safeDirection = Vector3.new(0, 1, 0)
-            end
-            local safeAirtime = math.max(tonumber(ThrowState.airtime) or 0.1, 0.1)
-            local g = Vector3.new(0, -GRAVITY, 0)
-            local x0 = lpHead.Position + (safeDirection.Unit * 5)
-
-            local tAttach0 = Instance.new('Attachment', workspace.Terrain)
-            local tAttach1 = Instance.new('Attachment', workspace.Terrain)
-
-            local tBeam = Instance.new('Beam')
-            tBeam.Attachment0 = tAttach0
-            tBeam.Attachment1 = tAttach1
-            tBeam.Segments = 7500
-            tBeam.Width0 = 1
-            tBeam.Width1 = 1
-            tBeam.FaceCamera = true
-            tBeam.Color = ColorSequence.new(Theme.Accent)
-            tBeam.Transparency = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 1),
-                NumberSequenceKeypoint.new(0.01, 0),
-                NumberSequenceKeypoint.new(1, 0),
-            })
-            tBeam.Parent = workspace.Terrain
-            RegisterVisualTheme(tBeam, function() tBeam.Color = ColorSequence.new(Theme.Accent) end)
-
-            local curve0, curve1, cf1, cf2 = Kinematics.BeamProjectile(g, safeDirection, x0, safeAirtime)
-            tBeam.CurveSize0 = curve0
-            tBeam.CurveSize1 = curve1
-            tAttach0.WorldCFrame = cf1
-            tAttach1.WorldCFrame = cf2
-            tBeam.Enabled = true
-
-            task.delay(safeAirtime, function()
-                tBeam:Destroy()
-                tAttach0:Destroy()
-                tAttach1:Destroy()
-            end)
+        if not (ball:GetAttribute('LocalAimbotBall') or (ball.Position - lpHead.Position).Magnitude < 15) then
+            return
         end
+
+        -- Capture the REAL launch state once (the actual ball at release, not the
+        -- aimbot's predicted direction) so the frozen arc matches the true throw.
+        local x0 = ball.Position
+        local v0 = ball.AssemblyLinearVelocity
+        if (not v0) or v0.Magnitude < 1 then -- velocity applied a frame late: resample
+            task.wait()
+            if not (ball and ball.Parent) then return end
+            x0 = ball.Position
+            v0 = ball.AssemblyLinearVelocity
+        end
+        if (not v0) or v0.Magnitude < 1 then
+            v0 = ThrowState.direction or Vector3.new(0, 1, 0)
+        end
+        if (tonumber(v0.Magnitude) or 0) < 1e-3 then
+            v0 = Vector3.new(0, 1, 0)
+        end
+
+        local g = Vector3.new(0, -GRAVITY, 0)
+        local groundY = 4
+
+        -- End the arc at the predicted landing point (clean single freeze).
+        local T = math.max(tonumber(ThrowState.airtime) or 1.5, 0.1)
+        if x0.Y > groundY then
+            local disc = (v0.Y * v0.Y) + (2 * GRAVITY * (x0.Y - groundY))
+            if disc > 0 then
+                local tLand = (v0.Y + math.sqrt(disc)) / GRAVITY
+                if tLand == tLand and tLand > 0.05 then
+                    T = tLand
+                end
+            end
+        end
+
+        local curve0, curve1, cf1, cf2 = Kinematics.BeamProjectile(g, v0, x0, T)
+
+        local tAttach0 = Instance.new('Attachment', workspace.Terrain)
+        local tAttach1 = Instance.new('Attachment', workspace.Terrain)
+
+        local tBeam = Instance.new('Beam')
+        tBeam.Attachment0 = tAttach0
+        tBeam.Attachment1 = tAttach1
+        tBeam.Segments = 7500
+        tBeam.Width0 = 1
+        tBeam.Width1 = 1
+        tBeam.FaceCamera = true
+        tBeam.Color = ColorSequence.new(Theme.Accent)
+        tBeam.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.01, 0),
+            NumberSequenceKeypoint.new(1, 0),
+        })
+        tBeam.Parent = workspace.Terrain
+        RegisterVisualTheme(tBeam, function() tBeam.Color = ColorSequence.new(Theme.Accent) end)
+
+        tBeam.CurveSize0 = curve0
+        tBeam.CurveSize1 = curve1
+        tAttach0.WorldCFrame = cf1
+        tAttach1.WorldCFrame = cf2
+        tBeam.Enabled = true
+
+        local removed = false
+        local function removeOnce()
+            if removed then return end
+            removed = true
+            tBeam:Destroy()
+            tAttach0:Destroy()
+            tAttach1:Destroy()
+        end
+
+        -- Vanish early if the ball is caught/picked up; otherwise outlive the
+        -- predicted flight by a short tail.
+        ball.AncestryChanged:Connect(function(_, parent)
+            if parent ~= workspace then
+                removeOnce()
+            end
+        end)
+        task.delay(math.clamp(T + 0.75, 1, 8), removeOnce)
     end
 
     -- ═══════════════════════════════════════════════════════════════
@@ -3959,11 +4002,32 @@ local function LoadQBAimbot()
     -- ══════════════════════════════════════════════════════════════════
     -- BALL TRAIL HANDLER
     -- ══════════════════════════════════════════════════════════════════
+    -- "My throw" = my character just RELEASED a Football (the carrier pattern
+    -- elsewhere in this script: the ball is a direct 'Football' child of the
+    -- holder's character). Distance-to-head alone misfires on nearby teammates'
+    -- throws, and 'LocalAimbotBall' is never set by this script.
+    local lastLocalRelease = 0
+
+    local function WatchLocalRelease(char)
+        char.ChildRemoved:Connect(function(child)
+            if child.Name == 'Football' then
+                lastLocalRelease = os.clock()
+            end
+        end)
+    end
+
+    if lp.Character then
+        WatchLocalRelease(lp.Character)
+    end
+    lp.CharacterAdded:Connect(WatchLocalRelease)
+
     workspace.ChildAdded:Connect(function(v)
         if not State.enableQbAimbot then return end
-        if v:IsA('BasePart') and v.Name == 'Football' then
-            BeamEngine.SpawnTrailBall(v)
+        if not (v:IsA('BasePart') and v.Name == 'Football') then return end
+        if not (v:GetAttribute('LocalAimbotBall') or (os.clock() - lastLocalRelease) < 0.5) then
+            return
         end
+        BeamEngine.SpawnTrailBall(v)
     end)
 
     -- ═══════════════════════════════════════════════════════════════
@@ -4448,7 +4512,7 @@ blatantMagnets = CatchingTab:CreateToggle({
 blatantMagnetRange = CatchingTab:CreateSlider({
 	Name = "Blatant Catch Distance",
 	Min = 0,
-	Max = 45,
+	Max = 30,
 	Default = 0,
 	Increment = .1,
 	Suffix = "",
@@ -4489,7 +4553,7 @@ task.spawn(function()
 		local charNow = player.Character
 		local rootNow = charNow and charNow:FindFirstChild("HumanoidRootPart")
 		if blatantMagnets.Value and rootNow then
-			local sizeNow = blatantMagnetRange.Value * 2
+			local sizeNow = math.min(blatantMagnetRange.Value, 30) * 2
 			_blatantMagnetsVisual.Size = Vector3.new(sizeNow, sizeNow, sizeNow)
 			_blatantMagnetsVisual.CFrame = CFrame.new(rootNow.Position)
 			_blatantMagnetsVisualRainbow.Size = Vector3.new(sizeNow + 0.4, sizeNow + 0.4, sizeNow + 0.4)
@@ -4529,7 +4593,7 @@ task.spawn(function()
 			continue
 		end
 		local s = (ball.Position - hrp.Position).Magnitude
-		if s <= 0 or s > blatantMagnetRange.Value then
+		if s <= 0 or s > math.min(blatantMagnetRange.Value, 30) then
 			continue
 		end
 		local r = hrp.CFrame
@@ -4557,7 +4621,7 @@ task.spawn(function()
         for _, catchPart in next, char:GetChildren() do
             if catchPart:IsA("BasePart") and catchPart.Name:lower():find("catch") then
                 local s = (ball.Position - catchPart.Position).Magnitude
-                if s <= blatantMagnetRange.Value then
+                if s <= math.min(blatantMagnetRange.Value, 30) then
                     pcall(function()
                         firetouchinterest(catchPart, ball, 0)
                         firetouchinterest(catchPart, ball, 1)
@@ -5365,7 +5429,8 @@ local function LoadPhysicsTab()
             end
 
             local originalSize = EndzoneEngine.originalSizes[endPart]
-            local zSize = Config.endzoneReachValue >= 10 and Config.endzoneReachValue or Config.endzoneReachValue / 10
+            local reach = math.clamp(tonumber(Config.endzoneReachValue) or 5, 5, 25)
+            local zSize = reach >= 10 and reach or reach / 10
             endPart.Size = Vector3.new(originalSize.X, originalSize.Y, zSize)
         end
     end
@@ -5608,7 +5673,7 @@ local function LoadPhysicsTab()
     endzoneReachValue = PhysicsTab:CreateSlider({
         Name = 'Endzone Reach',
         Min = 5,
-        Max = 35,
+        Max = 25,
         Default = 5,
         Increment = 1,
         Suffix = '',
@@ -7329,7 +7394,7 @@ local function LoadAutomaticsTab()
         if ok and obj then
             obj.Color = _rushColorOf(colorKey)
             obj.Thickness = thickness or 2
-            obj.Transparency = 0
+            obj.Transparency = 1 -- Drawing API alpha: 1 = fully visible (opposite of Part.Transparency)
             obj.Visible = false
             obj.ZIndex = 5
             if kind == 'Circle' then
@@ -7374,9 +7439,9 @@ local function LoadAutomaticsTab()
 
     function RushVisuals:HideAll()
         for _, d in pairs(self.elements) do
-            if typeof(d) == 'table' and d.Visible ~= nil then
+            pcall(function()
                 d.Visible = false
-            end
+            end)
         end
     end
 
